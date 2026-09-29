@@ -217,15 +217,23 @@ class _KanbanDispatcher:
         ``claim_task`` and never spawnable — a queue full of those is
         "correctly idle", not "stuck". The review column is probed only when
         review dispatch is on (same gate as the dispatcher): a task waiting
-        for a human reviewer is idle, not stuck.
+        for a human reviewer is idle, not stuck. Work held back by
+        ``max_in_progress`` / ``max_in_progress_per_profile`` is idle too: the
+        same caps the tick applies are passed to the probe.
         """
         kbd = _kbd()
         _review_probe = kbd.review_dispatch_enabled()
+        caps = {
+            "max_in_progress": self.settings.max_in_progress,
+            "max_in_progress_per_profile": self.settings.max_in_progress_per_profile,
+        }
         for slug in self._board_slugs():
             conn = None
             try:
                 conn = _kbc().connect(board=slug)
-                if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
+                if kbd.has_spawnable_ready(conn, board=slug, **caps) or (
+                    _review_probe and kbd.has_spawnable_review(conn, board=slug, **caps)
+                ):
                     return True
             except Exception:
                 continue

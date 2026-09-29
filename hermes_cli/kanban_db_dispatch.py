@@ -1761,7 +1761,21 @@ def dispatch_profile_allowlist_summary() -> str:
             "profile, or the config could not be read — omit the key to allow any)")
 
 
-def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+def _positive_cap(value: Any) -> Optional[int]:
+    """``value`` when it is a usable concurrency cap (int > 0), else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _has_spawnable(
+    conn: sqlite3.Connection,
+    status: str,
+    *,
+    max_in_progress: Optional[int] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    board: Optional[str] = None,
+) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
@@ -1769,26 +1783,77 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     ).fetchall()
     if not rows:
         return False
+    # Concurrency caps hold work back on purpose: a queue whose only work is
+    # waiting on a full host (``max_in_progress``) or on a busy assignee
+    # (``max_in_progress_per_profile``) is "correctly idle", not "stuck".
+    # Mirrors the gates in :func:`_dispatch_once_locked` (host-level global cap,
+    # per-board per-profile running counts).
+    global_cap = _positive_cap(max_in_progress)
+    if global_cap is not None:
+        total_running = count_running_tasks(conn) + count_running_tasks_other_boards(board)
+        if total_running >= global_cap:
+            return False
+    assignees = [row["assignee"] for row in rows]
+    per_profile_cap = _positive_cap(max_in_progress_per_profile)
+    if per_profile_cap is not None:
+        running = {
+            prow["assignee"]: int(prow["n"])
+            for prow in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL "
+                "GROUP BY assignee"
+            )
+        }
+        assignees = [a for a in assignees if running.get(a, 0) < per_profile_cap]
+        if not assignees:
+            return False
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    return any(profile_exists(a) for a in assignees)
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """True iff a ready+assigned+unclaimed task maps to a real Hermes profile.
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    *,
+    max_in_progress: Optional[int] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    board: Optional[str] = None,
+) -> bool:
+    """True iff a ready+assigned+unclaimed task maps to a real Hermes profile
+    and the dispatcher's concurrency caps would let it spawn.
 
     Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
-    "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
-    back to "any assigned" when ``profile_exists`` is unimportable.
+    "correctly idle" (only control-plane lanes waiting on ``claim_task``, or
+    work held back by ``max_in_progress`` / ``max_in_progress_per_profile``).
+    Caps default to ``None`` (not applied). ``board`` names the board ``conn``
+    belongs to so the host-level ``max_in_progress`` counts the other boards'
+    running workers exactly like the dispatcher. Falls back to "any assigned"
+    when ``profile_exists`` is unimportable.
     """
-    return _has_spawnable(conn, "ready")
+    return _has_spawnable(
+        conn, "ready",
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        board=board,
+    )
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(
+    conn: sqlite3.Connection,
+    *,
+    max_in_progress: Optional[int] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    board: Optional[str] = None,
+) -> bool:
     """:func:`has_spawnable_ready` for the review column."""
-    return _has_spawnable(conn, "review")
+    return _has_spawnable(
+        conn, "review",
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        board=board,
+    )
 
 
 def review_dispatch_enabled() -> bool:

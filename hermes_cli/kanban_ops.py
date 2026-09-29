@@ -206,10 +206,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     def _ready_queue_nonempty() -> bool:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
-        Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
+        Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck;
+        so is work held back by the same ``max_in_progress`` the daemon tick applies.
+        The daemon has no per-profile cap, so none is passed here."""
         try:
             with kbc.connect_closing() as conn:
-                return kbd.has_spawnable_ready(conn)
+                return kbd.has_spawnable_ready(
+                    conn,
+                    max_in_progress=kbd.resolve_max_in_progress(kbd.configured_max_in_progress()),
+                )
         except Exception:
             return False
 
