@@ -24,7 +24,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_BACKLOG_SCHEMA, KANBAN_UNBACKLOG_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -1179,6 +1179,45 @@ def _handle_unblock(args: dict, **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
+def _backlog_move(tool_name: str, args: dict, *, park: bool) -> str:
+    _reject_delegated_child_mutation(tool_name)
+    _require_orchestrator_tool(tool_name)
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    _enforce_worker_task_ownership(tid)
+    reason = args.get("reason")
+    reason = (str(reason).strip() or None) if reason is not None else None
+    author = os.environ.get("HERMES_PROFILE") or "orchestrator"
+    with _board(args.get("board")) as (kb, conn):
+        before = kb.get_task(conn, tid)
+        _check(before is not None, f"task {tid} not found")
+        if reason:
+            kb.add_comment(conn, tid, author, f"{'BACKLOG' if park else 'UNBACKLOG'}: {reason}")
+        if park:
+            ok = kb.backlog_task(conn, tid, reason=reason, author=author)
+            msg = (f"could not move {tid} to backlog (status {before.status!r}; review/done/"
+                   "archived/backlog cannot be parked, or the running worker did not stop)")
+        else:
+            ok = kb.unbacklog_task(conn, tid, reason=reason, author=author)
+            msg = f"could not unbacklog {tid} (status {before.status!r}, not 'backlog')"
+        _check(ok, msg)
+        return _ok(task_id=tid, previous_status=before.status,
+                   **_fields(kb.get_task(conn, tid), ("status",)))
+
+
+@_kanban_handler("kanban_backlog")
+def _handle_backlog(args: dict, **kw) -> str:
+    """Park a task in backlog (a running worker is stopped first)."""
+    return _backlog_move("kanban_backlog", args, park=True)
+
+
+@_kanban_handler("kanban_unbacklog")
+def _handle_unbacklog(args: dict, **kw) -> str:
+    """Return a backlog task to ready, or todo while parents remain open."""
+    return _backlog_move("kanban_unbacklog", args, park=False)
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links/running
@@ -1199,7 +1238,7 @@ def _handle_link(args: dict, **kw) -> str:
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_backlog", "kanban_unbacklog"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -1214,6 +1253,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+    ("kanban_backlog", KANBAN_BACKLOG_SCHEMA, _handle_backlog, "⏸"),
+    ("kanban_unbacklog", KANBAN_UNBACKLOG_SCHEMA, _handle_unbacklog, "▶"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:

@@ -216,7 +216,9 @@ _SPECS = [
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
-                  "to skip the brief running-to-blocked transition."),
+                  "to skip the brief running-to-blocked transition; "
+                  "'backlog' to park a fully written card the dispatcher "
+                  "must not take until `unbacklog`."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -328,6 +330,17 @@ _SPECS = [
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
+    _cmd("backlog", [
+        _reason("Optional note — recorded as a comment and on the backlogged event."),
+        _json_flag(help="Print one JSON object per task"),
+        _TASK_IDS,
+    ], help="Park tasks in Backlog: written and ready, but the dispatcher never takes "
+            "them. A running task's worker is stopped first."),
+    _cmd("unbacklog", [
+        _reason("Optional note — recorded as a comment and on the unbacklogged event."),
+        _json_flag(help="Print one JSON object per task"),
+        _TASK_IDS,
+    ], help="Return backlog tasks to ready, or todo while parents remain open"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,

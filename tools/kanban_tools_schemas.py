@@ -73,8 +73,8 @@ KANBAN_LIST_SCHEMA = _schema(
         "status": {
             "type": "string",
             "enum": [
-                "triage", "todo", "ready", "running",
-                "blocked", "done", "archived",
+                "triage", "todo", "backlog", "scheduled", "ready",
+                "running", "blocked", "review", "done", "archived",
             ],
             "description": "Optional task status filter.",
         },
@@ -445,12 +445,16 @@ KANBAN_CREATE_SCHEMA = _schema(
         )),
         "initial_status": {
             "type": "string",
-            "enum": ["running", "blocked"],
+            "enum": ["running", "blocked", "backlog"],
             "description": (
                 "Initial card status. Use 'blocked' for tasks that "
                 "require immediate human ops (R3 gate) to skip the "
-                "brief running-to-blocked transition. Defaults to "
-                "'running', which preserves the usual dispatch path."
+                "brief running-to-blocked transition. Use 'backlog' only "
+                "when the owner asked to park the card: it is fully "
+                "written but the dispatcher never takes it until "
+                "kanban_unbacklog. Defaults to 'running', which preserves "
+                "the usual dispatch path (ready, or todo while parents "
+                "are open)."
             ),
         },
         "skills": {
@@ -515,6 +519,36 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
+    },
+    ["task_id"],
+)
+
+KANBAN_BACKLOG_SCHEMA = _schema(
+    "kanban_backlog",
+    (
+        "Park a Kanban task in 'backlog': the card is fully written and "
+        "ready, but the dispatcher never claims or promotes it until "
+        "kanban_unbacklog. Allowed from todo, ready, blocked, triage and "
+        "scheduled; a running task's worker is stopped first. Use only when "
+        "the owner asked to put the card in the backlog. Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", "Task id to park."),
+        "reason": _prop("string", "Optional note; stored as a comment and on the event."),
+    },
+    ["task_id"],
+)
+
+KANBAN_UNBACKLOG_SCHEMA = _schema(
+    "kanban_unbacklog",
+    (
+        "Take a Kanban task out of 'backlog'. It moves to ready when all "
+        "parents are done, or todo while any parent remains open, and the "
+        "dispatcher picks it up as usual. Orchestrator-only."
+    ),
+    {
+        "task_id": _prop("string", "Backlog task id."),
+        "reason": _prop("string", "Optional note; stored as a comment and on the event."),
     },
     ["task_id"],
 )

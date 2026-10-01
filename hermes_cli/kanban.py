@@ -207,7 +207,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "backlog", "unbacklog", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1031,6 +1031,39 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_backlog_move(args: argparse.Namespace, *, park: bool) -> int:
+    """``backlog`` / ``unbacklog``: park a card, or return it to the queue."""
+    ids, rc = _require_ids(args)
+    if rc:
+        return rc
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    author = _profile_author()
+    as_json = bool(getattr(args, "json", False))
+    verb = "backlog" if park else "unbacklog"
+    failed: list[str] = []
+    with kbc.connect_closing() as conn:
+        for tid in ids:
+            before = kb.get_task(conn, tid)
+            if reason:
+                kb.add_comment(conn, tid, author, f"{verb.upper()}: {reason}")
+            mover = kb.backlog_task if park else kb.unbacklog_task
+            ok = mover(conn, tid, reason=reason, author=author)
+            after = kb.get_task(conn, tid)
+            frm, to = (before.status if before else None), (after.status if after else None)
+            if as_json:
+                print(json.dumps({"task_id": tid, "ok": bool(ok), "from": frm, "status": to},
+                                 ensure_ascii=False))
+            if not ok:
+                failed.append(tid)
+                if not as_json:
+                    why = ("unknown id, or status is review/done/archived/backlog, or the "
+                           "worker did not stop") if park else "unknown id, or not in backlog"
+                    print(f"cannot {verb} {tid} ({why})", file=sys.stderr)
+            elif not as_json:
+                print(f"{tid}: {frm} → {to}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1139,7 +1172,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     if _json_out(args, stats):
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in ("triage", "todo", "backlog", "scheduled", "ready", "running", "blocked", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
@@ -1327,6 +1360,8 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "backlog": lambda a: _cmd_backlog_move(a, park=True),
+    "unbacklog": lambda a: _cmd_backlog_move(a, park=False),
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

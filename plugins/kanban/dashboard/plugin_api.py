@@ -166,7 +166,7 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 
 # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column). Keep in
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
-BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
+BOARD_COLUMNS: list[str] = ["triage", "todo", "backlog", "scheduled", "ready", "running", "blocked", "review", "done"]
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -571,6 +571,8 @@ def _drag_to(conn, task_id: str, s: str) -> bool:
     current = kanban_db.get_task(conn, task_id) if s != "triage" else None
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
         return kanban_db.unblock_task(conn, task_id)
+    if s == "ready" and current and current.status == "backlog":
+        return kanban_db.unbacklog_task(conn, task_id, author="dashboard")
     if current is not None and current.status == "review":
         return kanban_db.reopen_review_task(conn, task_id)
     return _set_status_direct(conn, task_id, s)
@@ -584,6 +586,8 @@ _STATUS_HANDLERS: dict[str, Any] = {
         conn, tid, result=p.result, summary=p.summary, metadata=p.metadata, force=True),
     "blocked": lambda conn, tid, p: kanban_db.block_task(conn, tid, reason=getattr(p, "block_reason", None)),
     "scheduled": lambda conn, tid, p: kanban_db.schedule_task(conn, tid, reason=getattr(p, "block_reason", None)),
+    "backlog": lambda conn, tid, p: kanban_db.backlog_task(
+        conn, tid, reason=getattr(p, "block_reason", None), author="dashboard"),
     "review": lambda conn, tid, p: kanban_db.request_review(
         conn, tid, summary=p.summary, metadata=p.metadata, reviewer=(p.assignee or None), force=True),
     "ready": lambda conn, tid, p: _drag_to(conn, tid, "ready"),

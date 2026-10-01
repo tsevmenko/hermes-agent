@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, Optional
 from hermes_cli import kanban_db as kb
 
 _STATUS_ICONS = {
-    "todo": "◻", "ready": "▶", "running": "●", "scheduled": "⏱",
+    "todo": "◻", "ready": "▶", "running": "●", "scheduled": "⏱", "backlog": "⏸",
     "blocked": "⊘", "done": "✓", "archived": "—",
 }
 

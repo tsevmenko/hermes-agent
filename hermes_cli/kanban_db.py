@@ -100,8 +100,11 @@ def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
 
 # --- Constants ---
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_STATUSES = {"triage", "todo", "backlog", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+# ``running`` = the normal path (ready, or todo while parents are open);
+# ``blocked`` parks for human ops; ``backlog`` parks a fully written card the
+# dispatcher must not take until someone unbacklogs it.
+VALID_INITIAL_STATUSES = {"running", "blocked", "backlog"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
@@ -1406,6 +1409,11 @@ def create_task(
                         task_id,
                         "blocked",
                         {"reason": "initial_status", "status": "blocked", "actor": created_by or "user"},
+                    )
+                if task_status == "backlog":
+                    _append_event(
+                        conn, task_id, "backlogged",
+                        {"from": "created", "author": created_by} if created_by else {"from": "created"},
                     )
                 if task_status == "todo":
                     # Parked behind an open parent: record why, exactly as
@@ -3984,6 +3992,94 @@ def schedule_task(
         )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
         return True
+
+
+# Statuses a card can be parked into ``backlog`` from without touching a
+# worker. ``running`` is handled separately (its worker is stopped first);
+# ``review`` / ``done`` / ``archived`` are excluded — a review card is
+# mid-handoff and a finished card has nothing left to park.
+BACKLOG_PARKABLE_STATUSES = ("todo", "ready", "blocked", "triage", "scheduled")
+
+
+def backlog_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    author: Optional[str] = None, signal_fn=None,
+) -> bool:
+    """Park a task in ``backlog``: fully specified and ready, but on hold.
+
+    Every automatic mover ignores ``backlog``: the dispatcher claims only
+    ``ready``/``review``, ``recompute_ready`` promotes only ``todo``/``blocked``,
+    stale-claim and crash recovery look only at ``running``. The exit is
+    :func:`unbacklog_task` (or an explicit human status set).
+
+    A ``running`` task is stopped first, exactly as an operator reclaim stops
+    it (host-local SIGTERM, SIGKILL after a grace window). If the worker
+    survives, the park is refused so a live worker never keeps going on a
+    parked card. False when missing, already parked, or review/done/archived.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+    prev_status, prev_lock = row["status"], row["claim_lock"]
+    termination: dict[str, Any] = {}
+    if prev_status == "running":
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+        if _worker_survived_termination(termination):
+            return False
+    elif prev_status not in BACKLOG_PARKABLE_STATUSES:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'backlog', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL "
+            "WHERE id = ? AND status = ? AND claim_lock IS ?", (task_id, prev_status, prev_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(conn, task_id, outcome="backlogged", status="backlogged", summary=reason)
+        if run_id is None:
+            _reclaim_dangling_run(conn, task_id, statuses=("backlog",), now=now,
+                                  note="invariant recovery on backlog")
+            conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+        payload: dict[str, Any] = {"from": prev_status}
+        if reason:
+            payload["reason"] = reason
+        if author:
+            payload["author"] = author
+        payload.update(termination)
+        _append_event(conn, task_id, "backlogged", payload, run_id=run_id)
+    return True
+
+
+def unbacklog_task(
+    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+    author: Optional[str] = None,
+) -> bool:
+    """Return a ``backlog`` task to ``ready`` (``todo`` while any parent is
+    open — the same re-gate as :func:`unblock_task`). Resets the dispatcher
+    failure counter: unparking is a deliberate fresh start. False when the
+    task is missing or not in ``backlog``."""
+    with write_txn(conn):
+        new_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'backlog'", (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        payload: dict[str, Any] = {"status": new_status}
+        if reason:
+            payload["reason"] = reason
+        if author:
+            payload["author"] = author
+        _append_event(conn, task_id, "unbacklogged", payload)
+    return True
 
 
 # --- Worker context builder (what a spawned worker sees) ---
