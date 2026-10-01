@@ -66,6 +66,31 @@ MAX_SEND_FAILURES = 12
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
 
+def _owner_alert_covers(sub: dict, kind: str, ev: Any, board: Optional[str]) -> bool:
+    """True when ``kanban.owner_alerts`` already pushes this event to this chat.
+
+    Keeps the owner at ONE message per block: a ``notify`` subscription on the
+    same chat would otherwise repeat the owner alert with a terser line.
+    """
+    try:
+        from gateway import kanban_owner_alerts as _oa
+
+        cfg = _oa.load_config()
+        if not cfg.active:
+            return False
+        if cfg.boards is not None and board not in cfg.boards:
+            return False
+        if (sub.get("platform") or "").lower() != cfg.platform:
+            return False
+        if str(sub.get("chat_id") or "") != cfg.chat_id:
+            return False
+        if (sub.get("thread_id") or "") != (cfg.thread_id or ""):
+            return False
+        return _oa.classify(kind, getattr(ev, "payload", None), cfg) is not None
+    except Exception:
+        return False
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
     from agent.redact import redact_sensitive_text
@@ -715,6 +740,9 @@ class _KanbanNotification:
                 # Wake-only: the wake path is the sole delivery and resolves the counter.
                 continue
             if ev.id <= self.sub.get("last_ping_event_id", 0):
+                continue
+            if _owner_alert_covers(self.sub, ev.kind, ev, self.board_slug):
+                logger.debug("kanban notifier: %s event for %s already pushed by owner alerts", ev.kind, self.task_id)
                 continue
             try:
                 if await self._send_event(ev, msg) is False:

@@ -120,6 +120,96 @@ class GatewayKanbanWatchersMixin:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)
 
+    async def _kanban_owner_alert_watcher(self, interval: float = 10.0) -> None:
+        """Push every human-needed block to the owner's chat (``kanban.owner_alerts``).
+
+        Independent of task subscriptions: the per-sub notifier above only
+        reaches chats that subscribed to a task (and ``wake`` subs never send
+        a visible message), so a ``needs_input`` block could sit unseen until a
+        digest. This loop scans board events with its own cursor and sends one
+        message per new ``blocked`` (kind in ``block_kinds``) /
+        ``block_loop_detected`` / ``status → triage`` event; see
+        ``gateway/kanban_owner_alerts.py``. Runs only in the gateway that owns
+        the singleton dispatcher lock, so a fleet never double-sends.
+        """
+        from gateway.config import Platform as _Platform
+        from gateway import kanban_owner_alerts as _oa
+
+        await asyncio.sleep(8)
+        state: Optional[dict] = None
+        try:
+            for _p in getattr(self.config, "platforms", {}) or {}:
+                _home = self.config.get_home_channel(_p)
+                if _home and getattr(_home, "chat_id", None):
+                    _oa.set_home_channel(
+                        getattr(_p, "value", str(_p)), _home.chat_id,
+                        getattr(_home, "thread_id", None),
+                    )
+        except Exception as exc:
+            logger.debug("kanban owner alerts: cannot read home channels: %s", exc)
+        while self._running:
+            try:
+                cfg = _oa.load_config()
+                if cfg.active and self._owns_kanban_dispatcher_lock():
+                    if state is None:
+                        state = await asyncio.to_thread(_oa.load_state)
+                    alerts, new_cursors = await asyncio.to_thread(_oa.collect, cfg, state)
+                    try:
+                        plat = _Platform(cfg.platform)
+                    except ValueError:
+                        plat = None
+                    adapter = self._authorization_adapter(plat, None) if plat else None
+                    if alerts and adapter is None:
+                        logger.debug(
+                            "kanban owner alerts: no %s adapter connected; %d alert(s) wait",
+                            cfg.platform, len(alerts),
+                        )
+                    else:
+                        failed_boards: set[str] = set()
+                        metadata: dict[str, Any] = {}
+                        if cfg.thread_id:
+                            metadata["thread_id"] = cfg.thread_id
+                        for alert in alerts:
+                            if alert.board in failed_boards:
+                                continue
+                            try:
+                                res = await adapter.send(cfg.chat_id, alert.text, metadata=metadata)
+                                if getattr(res, "success", True) is False:
+                                    raise RuntimeError(getattr(res, "error", None) or "send reported failure")
+                            except Exception as exc:
+                                logger.warning(
+                                    "kanban owner alerts: send failed for %s (event %s): %s; will retry",
+                                    alert.task_id, alert.event_id, exc,
+                                )
+                                failed_boards.add(alert.board)
+                                # Hold this board's cursor just before the
+                                # failed event so it is retried next tick.
+                                new_cursors[alert.board] = min(
+                                    new_cursors.get(alert.board, alert.event_id),
+                                    alert.event_id - 1,
+                                )
+                                continue
+                            state.setdefault("sent", {})[
+                                _oa.dedup_key(alert.task_id, alert.reason)
+                            ] = time.time()
+                            logger.info(
+                                "kanban owner alerts: sent %s/%s for %s (event %s, board %s) to %s/%s message_id=%s",
+                                alert.event_kind, alert.block_kind, alert.task_id, alert.event_id,
+                                alert.board, cfg.platform, cfg.chat_id, getattr(res, "message_id", None),
+                            )
+                            if cfg.mirror_to_session:
+                                mirrored = await asyncio.to_thread(_oa.mirror_alert, cfg, alert)
+                                logger.info(
+                                    "kanban owner alerts: mirrored %s into %s/%s session: %s",
+                                    alert.task_id, cfg.platform, cfg.chat_id, mirrored,
+                                )
+                        state.setdefault("cursors", {}).update(new_cursors)
+                        _oa.prune_sent(state, time.time(), cfg.dedup_hours)
+                        await asyncio.to_thread(_oa.save_state, state)
+            except Exception as exc:
+                logger.warning("kanban owner alert tick failed: %s", exc)
+            await self._sleep_between_ticks(interval)
+
     def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
         from hermes_cli import kanban_db_connect as _kbc
